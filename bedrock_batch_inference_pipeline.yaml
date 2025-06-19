@@ -1,0 +1,555 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Automating Amazon Bedrock Batch Inference'
+
+Parameters:
+  ModelId:
+    Type: String
+    Description: '(Required) The ModelId to be used as an environment variable'
+  RoleArn:
+    Type: String
+    Description: '(Optional) The Bedrock Batch Inference IAM Role Arn'
+    Default: ''
+
+Conditions:
+  CreateNewRole: !Equals 
+    - !Ref RoleArn
+    - ''
+Resources:
+  # Creates DynamoDB Table to store job details
+  DynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: JobId
+          AttributeType: S
+        - AttributeName: Status
+          AttributeType: S
+        - AttributeName: CreatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: JobId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: Status
+              KeyType: HASH
+            - AttributeName: CreatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  # Lambda role with dynamodb write permissions
+  CreateBatchQueueLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                Resource: 
+                 - !GetAtt DynamoDBTable.Arn
+
+  CustomResourceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CustomResourcePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::aws-blogs-artifacts-public/*'
+              - Effect: Allow
+                Action:
+                  - 'lambda:PublishLayerVersion'
+                  - 'lambda:DeleteLayerVersion'
+                  - 'lambda:ListLayerVersions'
+                Resource:  !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:${AWS::StackName}-boto3-layer-*'
+
+  CreateLayerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-custom-layer-resource-${AWS::Region}'
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomResourceRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          import traceback
+          import tempfile
+
+          def lambda_handler(event, context):
+              print(f"Received event: {event}")
+              response_data = {}
+              try:
+                  lambda_client = boto3.client('lambda')
+                  if event['RequestType'] in ['Create', 'Update']:
+                      print("Creating/Updating layer")
+                      s3_client = boto3.client('s3', region_name=os.environ['SOURCE_BUCKET_REGION'])
+
+                      print(f"Downloading ZIP from {os.environ['SOURCE_BUCKET_NAME']}/{os.environ['LAYER_ZIP_KEY']}")
+                      with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+                          s3_client.download_fileobj(os.environ['SOURCE_BUCKET_NAME'], os.environ['LAYER_ZIP_KEY'], tmp_file)
+                      
+                      print("Publishing layer")
+                      with open(tmp_file.name, 'rb') as zip_file:
+                          layer_response = lambda_client.publish_layer_version(
+                              LayerName=os.environ['LAYER_NAME'],
+                              Description='Layer created from cross-region S3 bucket',
+                              Content={'ZipFile': zip_file.read()},
+                              CompatibleRuntimes=os.environ['COMPATIBLE_RUNTIMES'].split(',')
+                          )
+
+                      os.unlink(tmp_file.name)  # Clean up the temporary file
+
+                      response_data['LayerVersionArn'] = layer_response['LayerVersionArn']
+                      print(f"Layer created successfully: {response_data['LayerVersionArn']}")
+
+                  elif event['RequestType'] == 'Delete':
+                      print("Deleting layer versions")
+                      versions = lambda_client.list_layer_versions(LayerName=os.environ['LAYER_NAME'])
+                      for version in versions['LayerVersions']:
+                          lambda_client.delete_layer_version(
+                              LayerName=os.environ['LAYER_NAME'],
+                              VersionNumber=version['Version']
+                          )
+                      print("All layer versions deleted")
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  print(f"Traceback: {traceback.format_exc()}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 3008
+      Environment:
+        Variables:
+          SOURCE_BUCKET_NAME: aws-blogs-artifacts-public
+          SOURCE_BUCKET_REGION: us-east-1
+          LAYER_ZIP_KEY: artifacts/ML-17595/boto3_layer-7b927d46-abaa-4f2b-9ed5-9d53e20fbc37.zip
+          LAYER_NAME: !Sub '${AWS::StackName}-boto3-layer-${AWS::Region}'
+          COMPATIBLE_RUNTIMES: python3.12
+
+  CreateLayerCustomResource:
+    Type: 'Custom::CreateLayer'
+    Properties:
+      ServiceToken: !GetAtt CreateLayerFunction.Arn
+
+  # Lambda Function triggered by S3 which creates job enteries in dynamodb
+  CreateBatchQueueLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-create-batch-queue-${AWS::Region}'
+      Handler: index.lambda_handler
+      Role: !GetAtt CreateBatchQueueLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+          
+          tableName = os.environ['TABLE_NAME']
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(tableName)
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  job_id = str(uuid.uuid4())
+                  table.put_item(
+                      Item={
+                          'JobId': job_id,
+                          'Status': 'Pending',
+                          'CreatedAt': datetime.now().isoformat(),
+                          'S3InputLocation': f's3://{bucket}/{key}',
+                          'S3OutputLocation': f's3://{bucket}/processed/',
+                          'LastUpdated': datetime.now().isoformat(),
+                      }
+                  )
+      Runtime: python3.12
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTable
+
+  S3BucketLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref CreateBatchQueueLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::br-batch-inference-${AWS::AccountId}-${AWS::Region}'
+
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'br-batch-inference-${AWS::AccountId}-${AWS::Region}'
+      ObjectLockEnabled: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt CreateBatchQueueLambdaFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: to-process/
+                  - Name: suffix
+                    Value: .jsonl
+
+  BedRockRole:
+    Type: AWS::IAM::Role
+    Condition: CreateNewRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub 'arn:aws:s3:::br-batch-inference-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::br-batch-inference-${AWS::AccountId}-${AWS::Region}/*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:TagResource
+                  - bedrock:UntagResource
+                  - bedrock:ListTagsForResource
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:GetModelInvocationJob
+                  - bedrock:ListModelInvocationJobs
+                  - bedrock:StopModelInvocationJob
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-job/*'
+
+  # Lambda Function role with DynamoDB read/write permissions, IAM Pass, Bedrock Model read write permissions
+  ProcessBatchJobLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBReadWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: 
+                  - !GetAtt DynamoDBTable.Arn
+                  - !Sub '${DynamoDBTable.Arn}/index/StatusIndex'
+        - PolicyName: PassRolePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: !If 
+                  - CreateNewRole
+                  - !GetAtt BedRockRole.Arn
+                  - !Ref RoleArn
+        - PolicyName: BedrockInvokeModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:ListModelInvocationJobs'
+                  - 'bedrock:GetModelInvocationJob'
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:CreateModelInvocationJob'
+                  - 'bedrock:StopModelInvocationJob'
+                  - 'bedrock:GetModelInvocationLoggingConfiguration'
+                  - 'bedrock:GetModelImportJob'
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-job/*'
+
+  # Lambda function to update status of jobs and create new inference job when Quota slot becomes available.
+  ProcessBatchJobLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-process-batch-job-${AWS::Region}'
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessBatchJobLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          from boto3.dynamodb.conditions import Key, Attr
+          from datetime import datetime, timedelta
+          import uuid
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource('dynamodb')
+          bedrock_client = boto3.client(service_name="bedrock")
+          table_name = os.environ['TABLE_NAME']
+          table = dynamodb.Table(table_name)
+
+          current_quota = 10
+          bedrock_role_arn = os.environ['ROLE_ARN']
+          model_id = os.environ['MODEL_ID']
+
+          def lambda_handler(event, context):
+              logger.info("Starting lambda_handler")
+              try:
+                  update_job_statuses()
+                  start_new_jobs()
+                  clean_up_old_jobs()
+              except Exception as e:
+                  logger.error(f"An error occurred in lambda_handler: {str(e)}")
+              logger.info("Finished lambda_handler")
+
+          def get_running_jobs():
+              response = table.scan(
+                  FilterExpression=Attr('Status').is_in(['InProgress', 'Submitted', 'Validating', 'Scheduled'])
+              )
+              jobs = response['Items']
+              logger.info(f"Found {len(jobs)} active jobs in DynamoDB")
+              return jobs
+
+          def update_job_statuses():
+              logger.info("Updating job statuses")
+              running_jobs = get_running_jobs()
+              for job in running_jobs:
+                  if 'BedrockJobArn' in job:
+                      current_status = check_job_status(job['BedrockJobArn'])
+                      if current_status != job['Status']:
+                          update_job_in_dynamodb(job['JobId'], current_status)
+
+          def check_job_status(bedrock_job_arn):
+              try:
+                  job_response = bedrock_client.get_model_invocation_job(jobIdentifier=bedrock_job_arn)
+                  return job_response['status']
+              except Exception as e:
+                  logger.error(f"Error getting job status for {bedrock_job_arn}: {e}")
+                  return 'Failed'
+
+          def update_job_in_dynamodb(job_id, status, bedrock_job_arn=None):
+              logger.info(f"Updating job {job_id} status to {status}")
+              update_expression = 'SET #status = :status, LastUpdated = :time'
+              expression_attribute_names = {'#status': 'Status'}
+              expression_attribute_values = {
+                  ':status': status,
+                  ':time': datetime.now().isoformat()
+              }
+              
+              if bedrock_job_arn:
+                  update_expression += ', BedrockJobArn = :bedrock_job_arn'
+                  expression_attribute_values[':bedrock_job_arn'] = bedrock_job_arn
+
+              if status in ['Completed', 'Failed', 'Stopped', 'PartiallyCompleted', 'Expired']:
+                  ttl = int((datetime.now() + timedelta(days=30)).timestamp())  # 30 days retention
+                  update_expression += ', #ttl = :ttl'
+                  expression_attribute_names['#ttl'] = 'TTL'
+                  expression_attribute_values[':ttl'] = ttl
+
+              table.update_item(
+                  Key={'JobId': job_id},
+                  UpdateExpression=update_expression,
+                  ExpressionAttributeNames=expression_attribute_names,
+                  ExpressionAttributeValues=expression_attribute_values
+              )
+
+          def start_new_jobs():
+              running_jobs = get_running_jobs()
+              available_slots = max(0, current_quota - len(running_jobs))
+              logger.info(f"Available slots: {available_slots}")
+              
+              if available_slots == 0:
+                  logger.info("No available slots. Stopping job creation.")
+                  return
+
+              pending_jobs = get_pending_jobs(available_slots)
+              for job in pending_jobs:
+                  try:
+                      bedrock_job_arn, output_s3_uri = process_inference_job(job['S3InputLocation'], job['S3OutputLocation'])
+                      update_job_in_dynamodb(job['JobId'], 'InProgress', bedrock_job_arn)
+                      logger.info(f"Successfully started job {job['JobId']}")
+                      available_slots -= 1
+                      if available_slots == 0:
+                          logger.info("No more available slots. Stopping job creation.")
+                          break
+                  except Exception as e:
+                      logger.error(f"Failed to start job {job['JobId']}: {str(e)}")
+                      if "ServiceQuotaExceededException" in str(e):
+                          logger.warning("Service quota exceeded. Stopping job creation.")
+                          break
+
+          def get_pending_jobs(limit):
+              response = table.query(
+                  IndexName='StatusIndex',
+                  KeyConditionExpression=Key('Status').eq('Pending'),
+                  Limit=limit,
+                  ScanIndexForward=True  # Sort by CreatedAt in ascending order
+              )
+              jobs = response['Items']
+              logger.info(f"Found {len(jobs)} pending jobs")
+              return jobs
+
+          def process_inference_job(INPUT_PATH, OUTPUT_PATH):
+              logger.info('Submitting a new batch job')
+              input_data_config = {
+                  's3InputDataConfig': {
+                      's3Uri': INPUT_PATH
+                  }
+              }
+
+              output_data_config = {
+                  's3OutputDataConfig': {
+                      's3Uri': OUTPUT_PATH
+                  }
+              }
+
+              unique_id = str(uuid.uuid4())
+              job_name = f'batch-job-{unique_id}'
+
+              response = bedrock_client.create_model_invocation_job(
+                  roleArn=bedrock_role_arn,
+                  modelId=model_id,
+                  jobName=job_name,
+                  inputDataConfig=input_data_config,
+                  outputDataConfig=output_data_config
+              )
+              bedrock_job_arn = response['jobArn']
+              output_s3_uri = output_data_config['s3OutputDataConfig']['s3Uri']
+              logger.info(f"Created new job with ARN: {bedrock_job_arn}")
+              return bedrock_job_arn, output_s3_uri
+
+          def clean_up_old_jobs():
+              logger.info("Cleaning up old jobs")
+              week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+              response = table.scan(
+                  FilterExpression=Key('Status').eq('Completed') & Key('LastUpdated').lt(week_ago)
+              )
+              deleted_count = 0
+              with table.batch_writer() as batch:
+                  for item in response['Items']:
+                      batch.delete_item(Key={'JobId': item['JobId']})
+                      deleted_count += 1
+              logger.info(f"Deleted {deleted_count} old completed jobs")
+      Runtime: python3.12
+      Layers:
+        - !GetAtt CreateLayerCustomResource.LayerVersionArn
+      Environment:
+        Variables:
+          MODEL_ID: !Ref ModelId
+          TABLE_NAME: !Ref DynamoDBTable
+          ROLE_ARN: !If 
+            - CreateNewRole
+            - !GetAtt BedRockRole.Arn
+            - !Ref RoleArn
+
+  # EventBridge Rule to trigger Lambda every 15 minutes
+  EventBridgeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${AWS::StackName}-eventbridge-rule-${AWS::Region}'
+      Description: 'Trigger Lambda every 15 minutes'
+      ScheduleExpression: 'rate(15 minutes)'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt ProcessBatchJobLambdaFunction.Arn
+          Id: 'DynamoDBLambdaTarget'
+
+  EventBridgeLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref ProcessBatchJobLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+Outputs:
+  S3BucketName:
+    Description: 'Name of the created S3 bucket'
+    Value: !Ref S3Bucket
+  DynamoDBTableName:
+    Description: 'Name of the created DynamoDB table'
+    Value: !Ref DynamoDBTable
+  CreateBatchQueueLambdaFunctionArn:
+    Description: 'ARN of the Lambda function to create job enteries in dynamodb'
+    Value: !GetAtt CreateBatchQueueLambdaFunction.Arn
+  ProcessBatchJobLambdaFunctionArn:
+    Description: 'ARN of the Lambda function which processes inference jobs'
+    Value: !GetAtt ProcessBatchJobLambdaFunction.Arn
