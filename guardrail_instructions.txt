@@ -1,0 +1,432 @@
+# AWS Bedrock Guardrail Testing Script
+
+A comprehensive Python script for testing AWS Bedrock Guardrails with performance metrics analysis, designed for data engineers working with large-scale AI safety validation.
+
+## Table of Contents
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [AWS Setup](#aws-setup)
+- [Usage](#usage)
+- [Command Line Options](#command-line-options)
+- [Dataset Requirements](#dataset-requirements)
+- [Auto-Discovery Features](#auto-discovery-features)
+- [Output Format](#output-format)
+- [Performance Metrics](#performance-metrics)
+- [Examples](#examples)
+- [Troubleshooting](#troubleshooting)
+- [Best Practices](#best-practices)
+
+## Overview
+
+This script enables you to:
+- Test AWS Bedrock Guardrails against large datasets (500K+ records)
+- Process data in configurable batches for memory efficiency
+- Support multiple file formats (CSV, Parquet, JSONL)
+- Auto-discover text and ground truth columns
+- Calculate comprehensive performance metrics
+- Generate detailed output reports with confidence scores
+
+## Prerequisites
+
+- **Python**: 3.8 or higher
+- **AWS Account**: With Bedrock access and configured guardrails
+- **AWS CLI**: Configured with appropriate credentials
+- **Memory**: Minimum 4GB RAM recommended for large datasets
+- **Storage**: Sufficient space for output files (roughly 2x input file size)
+
+## Installation
+
+### 1. Clone or Download the Script
+```bash
+# Download the script files
+# - guardrail_tester.py
+# - requirements.txt
+# - README.md (this file)
+```
+
+### 2. Create Virtual Environment (Recommended)
+```bash
+# Create virtual environment
+python3 -m venv bedrock-guardrail-env
+
+# Activate virtual environment
+# On Windows:
+bedrock-guardrail-env\Scripts\activate
+# On macOS/Linux:
+source bedrock-guardrail-env/bin/activate
+```
+
+### 3. Install Dependencies
+```bash
+pip install -r requirements.txt
+pip install -r guardrail_requirements.txt
+```
+
+### 4. Verify Installation
+```bash
+python guardrail_tester.py --help
+```
+
+## AWS Setup
+
+### 1. AWS Credentials Configuration
+Choose one of the following methods:
+
+#### Option A: AWS CLI Configuration
+```bash
+aws configure
+# Enter your AWS Access Key ID, Secret Access Key, and region
+```
+
+#### Option B: Environment Variables
+```bash
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+export AWS_DEFAULT_REGION=us-east-1
+```
+
+
+#### Option C: IAM Role (for EC2 instances)
+Attach an IAM role with Bedrock permissions to your EC2 instance.
+
+### 2. Required IAM Permissions
+Your AWS credentials need the following permissions:
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "bedrock:ApplyGuardrail",
+                "bedrock:GetGuardrail",
+                "bedrock:ListGuardrails"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+```
+
+### 3. Create Bedrock Guardrail
+Before running the script, you need a configured Bedrock Guardrail:
+
+1. **Via AWS Console:**
+   - Navigate to Amazon Bedrock console
+   - Go to "Guardrails" section
+   - Create a new guardrail with high thresholds
+   - Note the Guardrail ID (format: `gr-xxxxxxxxx`)
+
+2. **Recommended Configuration:**
+   - **Content Filters**: ALL set to HIGH threshold
+     - Sexual content: HIGH
+     - Violence: HIGH
+     - Hate speech: HIGH
+     - Insults: HIGH
+     - Misconduct: HIGH
+     - Prompt attacks: HIGH
+   - **Action**: BLOCKED
+   - **Input format**: TEXT
+
+## Usage
+
+### Basic Syntax
+```bash
+python guardrail_tester.py --dataset <path> --guardrail-id <id> [options]
+```
+
+### Minimum Required Command
+```bash
+python3 guardrail_tester.py --dataset jbb_harmful-behaviors.csv --guardrail-id gr-xxxxx
+```
+
+## Command Line Options
+
+| Option | Short | Required | Default | Description |
+|--------|-------|----------|---------|-------------|
+| `--dataset` | `-d` | ✅ | - | Path to dataset file (CSV/Parquet/JSONL) |
+| `--guardrail-id` | `-g` | ✅ | - | AWS Bedrock Guardrail ID |
+| `--guardrail-version` | `-v` | ❌ | `DRAFT` | Guardrail version number |
+| `--region` | `-r` | ❌ | `us-east-1` | AWS region |
+| `--batch-size` | `-b` | ❌ | `1000` | Records per batch |
+| `--text-column` | `-t` | ❌ | Auto-detected | Column containing text to test |
+| `--gt-column` | | ❌ | Auto-detected | Ground truth column name |
+| `--output` | `-o` | ❌ | Auto-generated | Output CSV file path |
+| `--log-level` | | ❌ | `INFO` | Logging level (DEBUG/INFO/WARNING/ERROR) |
+
+## Dataset Requirements
+
+### Supported File Formats
+- **CSV**: Comma-separated values (.csv)
+- **Parquet**: Apache Parquet format (.parquet)
+- **JSONL**: JSON Lines format (.jsonl)
+
+### Required Columns
+1. **Text Column**: Contains the prompts/text to test against guardrails
+2. **Ground Truth Column** (Optional): Binary labels for performance metrics
+
+### File Size Considerations
+- **Small datasets** (< 10K records): Process directly
+- **Medium datasets** (10K - 100K records): Default batch size works well
+- **Large datasets** (100K+ records): Consider increasing batch size to 2000-5000
+- **Very large datasets** (1M+ records): Use batch size 5000+ and monitor memory usage
+
+## Auto-Discovery Features
+
+The script automatically identifies column names to handle different dataset formats:
+
+### Text Column Detection
+**Primary candidates** (exact match, case-insensitive):
+- `text`, `content`, `prompt`, `input`, `message`, `query`
+- `question`, `statement`, `sentence`, `paragraph`, `data`
+- `text_content`, `input_text`, `prompt_text`, `user_input`
+
+**Secondary detection**:
+- Columns containing keywords: "text", "content", "prompt", "input"
+- String columns with average text length > 10 characters
+
+### Ground Truth Column Detection
+**Primary candidates** (exact match, case-insensitive):
+- `label`, `ground_truth`, `is_harmful`, `is_toxic`, `is_blocked`
+- `harmful`, `toxic`, `blocked`, `flagged`, `violation`
+- `target`, `class`, `category`, `classification`, `gt`
+
+**Secondary detection**:
+- Binary columns with values like: 0/1, true/false, yes/no, harmful/safe
+
+### Manual Override
+You can always override auto-discovery:
+```bash
+python guardrail_tester.py \
+  --dataset data.csv \
+  --guardrail-id gr-123456789 \
+  --text-column "user_prompt" \
+  --gt-column "violation_flag"
+```
+
+## Output Format
+
+### Output Files
+1. **Main Results File**: `guardrail_test_results_[dataset_name]_[timestamp].csv`
+2. **Intermediate Files**: `guardrail_test_results_temp_batch_[N].csv` (every 5 batches)
+
+### Output Columns
+- `text`: Original input text
+- `action`: Guardrail action (GUARDRAIL_INTERVENED/NONE/ERROR)
+- `is_blocked`: Boolean indicating if content was blocked
+- `latency_ms`: Processing time in milliseconds
+- `assessments`: Full guardrail assessment details (JSON)
+- `confidence`: Highest confidence score from assessments
+- `strength`: Strongest filter strength detected
+- `detected_categories`: List of violated content categories
+- `timestamp`: Processing timestamp
+- `ground_truth`: Original ground truth value (if available)
+- `ground_truth_blocked`: Boolean version of ground truth (if available)
+
+### Performance Summary Row
+The last row contains `PERFORMANCE_SUMMARY` with all calculated metrics in the `assessments` column as JSON.
+
+## Performance Metrics
+
+When ground truth data is available, the script calculates:
+
+### Core Metrics
+- **Accuracy (%)**: Overall correctness of predictions
+- **Precision**: True positives / (True positives + False positives)
+- **Recall**: True positives / (True positives + False negatives)
+- **F1 Score**: Harmonic mean of precision and recall
+
+### Detailed Metrics
+- **False Positive Rate**: Incorrectly flagged safe content
+- **False Negative Rate**: Missed harmful content
+- **True Positive Rate**: Correctly detected harmful content
+- **True Negative Rate**: Correctly identified safe content
+
+### Performance Metrics
+- **Average Latency (ms)**: Per-prompt processing time
+- **Total Samples**: Number of records with ground truth
+- **Confusion Matrix**: TP, TN, FP, FN counts
+
+## Examples
+
+### Example 1: Basic Testing with Auto-Discovery
+```bash
+python guardrail_tester.py \
+  --dataset toxic_comments.csv \
+  --guardrail-id gr-abc123def456
+```
+
+### Example 2: Large Dataset with Custom Batch Size
+```bash
+python guardrail_tester.py \
+  --dataset large_prompts.parquet \
+  --guardrail-id gr-abc123def456 \
+  --batch-size 2000 \
+  --region us-west-2
+```
+
+### Example 3: Specific Columns and Output Path
+```bash
+python guardrail_tester.py \
+  --dataset user_inputs.jsonl \
+  --guardrail-id gr-abc123def456 \
+  --text-column "user_message" \
+  --gt-column "is_violation" \
+  --output custom_results.csv
+```
+
+### Example 4: Debug Mode with Detailed Logging
+```bash
+python guardrail_tester.py \
+  --dataset test_data.csv \
+  --guardrail-id gr-abc123def456 \
+  --log-level DEBUG
+```
+
+### Example 5: Production Run with Custom Guardrail Version
+```bash
+python guardrail_tester.py \
+  --dataset production_prompts.csv \
+  --guardrail-id gr-abc123def456 \
+  --guardrail-version "2" \
+  --batch-size 1500 \
+  --output prod_validation_results.csv
+```
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+#### 1. "Guardrail not found" Error
+```
+Error: The guardrail gr-xxx was not found
+```
+**Solution**: 
+- Verify guardrail ID is correct
+- Check AWS region matches guardrail region
+- Ensure guardrail is in active state
+
+#### 2. "Access Denied" Error
+```
+Error: User is not authorized to perform: bedrock:ApplyGuardrail
+```
+**Solution**:
+- Check IAM permissions (see AWS Setup section)
+- Verify AWS credentials are configured correctly
+- Ensure Bedrock service is available in your region
+
+#### 3. "Column not found" Error
+```
+Error: Text column 'text' not found in dataset
+```
+**Solution**:
+- Check available columns with: `--log-level DEBUG`
+- Manually specify column: `--text-column "your_column_name"`
+- Verify dataset file is not corrupted
+
+#### 4. Memory Issues with Large Datasets
+```
+MemoryError: Unable to allocate memory
+```
+**Solution**:
+- Reduce batch size: `--batch-size 500`
+- Process dataset in smaller chunks
+- Use a machine with more RAM
+- Consider using Parquet format for better memory efficiency
+
+#### 5. Slow Processing Speed
+**Optimization strategies**:
+- Increase batch size for better throughput
+- Use faster storage (SSD)
+- Choose AWS region closer to your location
+- Process during off-peak hours
+
+#### 6. File Format Issues
+```
+Error: Unsupported file format: .xlsx
+```
+**Solution**:
+- Convert Excel files to CSV: `pandas.read_excel().to_csv()`
+- Use supported formats: CSV, Parquet, JSONL
+- Check file extension is correct
+
+### Debug Commands
+
+#### Check Dataset Structure
+```bash
+python -c "
+import pandas as pd
+df = pd.read_csv('your_dataset.csv')
+print('Columns:', list(df.columns))
+print('Shape:', df.shape)
+print('Sample data:')
+print(df.head())
+"
+```
+
+#### Test AWS Connectivity
+```bash
+aws bedrock list-guardrails --region us-east-1
+```
+
+#### Validate Guardrail
+```bash
+aws bedrock get-guardrail --guardrail-identifier gr-your-id --region us-east-1
+```
+
+## Best Practices
+
+### Dataset Preparation
+1. **Clean your data**: Remove null values in text columns
+2. **Consistent encoding**: Ensure UTF-8 encoding for text files
+3. **Reasonable text length**: Very long texts (>10K chars) may cause issues
+4. **Ground truth format**: Use binary values (0/1, True/False) for ground truth
+
+### Performance Optimization
+1. **Batch size tuning**:
+   - Small datasets (< 10K): 500-1000
+   - Medium datasets (10K-100K): 1000-2000
+   - Large datasets (100K+): 2000-5000
+
+2. **File format selection**:
+   - **Parquet**: Best for large datasets (faster loading, smaller size)
+   - **CSV**: Good for small-medium datasets
+   - **JSONL**: Use when data is naturally in JSON format
+
+3. **Resource management**:
+   - Monitor memory usage during processing
+   - Use SSD storage for faster I/O
+   - Process during low-latency periods
+
+### Production Deployment
+1. **Error handling**: Always check intermediate batch files
+2. **Monitoring**: Use `--log-level INFO` for production runs
+3. **Backup**: Keep copies of original datasets
+4. **Validation**: Test with small samples before full runs
+5. **Scheduling**: Use batch processing for large datasets during off-peak hours
+
+### Security Considerations
+1. **Credential management**: Use IAM roles instead of access keys when possible
+2. **Data privacy**: Ensure datasets don't contain sensitive information
+3. **Output security**: Secure output files containing test results
+4. **Audit logging**: Keep logs of processing runs for compliance
+
+### Cost Optimization
+1. **Batch processing**: Larger batches reduce API call overhead
+2. **Region selection**: Use same region as your data to reduce latency
+3. **Guardrail efficiency**: Optimize guardrail configurations for your use case
+4. **Resource sizing**: Right-size compute resources for your workload
+
+## Support and Contact
+
+For issues related to:
+- **AWS Bedrock**: Check AWS Bedrock documentation and support
+- **Script bugs**: Review error logs and troubleshooting section
+- **Performance**: Follow optimization guidelines above
+
+---
+
+**Last Updated**: June 2025  
+**Script Version**: 1.0  
+**Python Compatibility**: 3.8+
